@@ -1,8 +1,6 @@
 -- ============================================================================
---  ZYVORA FARM v1  |  Blox Fruits Farming Module
+--  ZYVORA FARM v1  |  Blox Fruits Farming Module (Fixed Build)
 --  Theme: Classic Crimson Red & Obsidian Black
---  Note: Remote payloads & map/NPC tables marked [VERIFY ON BUILD] use safe
---        guards so missing remotes/paths never crash the main loop.
 -- ============================================================================
 
 local Players           = game:GetService("Players")
@@ -20,14 +18,13 @@ local WORLD_1 = game.PlaceId == 2753915549 or game.PlaceId == 85211729168715
 local WORLD_2 = game.PlaceId == 4442272183 or game.PlaceId == 79091703265657
 local WORLD_3 = game.PlaceId == 7449423635 or game.PlaceId == 100117331123089
 
--- Clean previous instance if re-executed
 local env = (type(getgenv) == "function" and getgenv()) or _G
 if env.ZYVORA_FARM_V1 then
 	pcall(function() env.ZYVORA_FARM_V1.Destroy() end)
 end
 
 -- ============================================================================
---  CONFIG & STATE
+--  CONFIG & RUNTIME STATE
 -- ============================================================================
 local CFG = {
 	-- Core Farm
@@ -39,6 +36,8 @@ local CFG = {
 	FarmMode          = "Above", -- "Above" | "Orbit"
 	BossPriority      = true,
 	SkipStuckMobs     = true,
+	AutoEquipTool     = true,
+	PreferredSlot     = "1",
 
 	-- Combat, Mastery & Fruits
 	FastAttack        = false,
@@ -64,7 +63,7 @@ local CFG = {
 	SpeedEnabled      = false,
 	SpeedValue        = 65,
 	JumpEnabled       = false,
-	JumpValue         = 65,
+	JumpValue        = 65,
 	Noclip            = false,
 	WalkOnWater       = false,
 
@@ -74,22 +73,21 @@ local CFG = {
 }
 
 local Runtime = {
-	Alive         = true,
-	Connections   = {},
-	Threads       = {},
-	VisitedJobs   = {},
-	StuckUntil    = {},
-	WaterParts    = {},
-	FoundRemote   = nil,
-	FoundRemoteId = nil,
-	NetFolder     = nil,
+	Alive          = true,
+	Connections    = {},
+	Threads        = {},
+	VisitedJobs    = {},
+	StuckUntil     = {},
+	WaterPad       = nil,
+	FoundRemote    = nil,
+	FoundRemoteId  = nil,
+	NetFolder      = nil,
 	RegisterAttack = nil,
-	RegisterHit   = nil,
-	CommF         = nil,
-	CommE         = nil,
-	StatusText    = "Idle — ready",
-	KillsSession  = 0,
-	StartClock    = os.clock(),
+	RegisterHit    = nil,
+	CommF          = nil,
+	CommE          = nil,
+	StatusText     = "Idle — ready",
+	StartClock     = os.clock(),
 }
 
 local function TrackConn(conn)
@@ -108,7 +106,7 @@ local function SetStatus(msg)
 end
 
 -- ============================================================================
---  CHARACTER, WORLD & REMOTE DISCOVERY HELPERS
+--  CHARACTER, WORLD & REMOTE HELPERS
 -- ============================================================================
 local function GetChar()
 	return LocalPlayer.Character
@@ -129,7 +127,10 @@ local function IsValidLivingModel(model)
 	if not model or model == char then return false end
 	local hrp = model:FindFirstChild("HumanoidRootPart")
 	local hum = model:FindFirstChildOfClass("Humanoid")
-	return (hrp and hrp:IsA("BasePart") and hum and hum.Health > 0) and hrp, hum
+	if hrp and hrp:IsA("BasePart") and hum and hum.Health > 0 then
+		return hrp, hum
+	end
+	return nil, nil
 end
 
 local function GetCurrentSea()
@@ -145,6 +146,13 @@ local function GetPlayerLevel()
 	return (lvl and typeof(lvl.Value) == "number" and lvl.Value) or 1
 end
 
+local function FormatUptime()
+	local sec = math.max(0, math.floor(os.clock() - Runtime.StartClock))
+	local m = math.floor(sec / 60)
+	local s = sec % 60
+	return ("%02dm:%02ds"):format(m, s)
+end
+
 local function DiscoverRemotes()
 	pcall(function()
 		local remotes = ReplicatedStorage:FindFirstChild("Remotes")
@@ -156,12 +164,6 @@ local function DiscoverRemotes()
 		end
 		Runtime.NetFolder = ReplicatedStorage:FindFirstChild("Net", true)
 
-		local folders = {}
-		for _, name in ipairs({ "Util", "Common", "Remotes", "Assets", "FX", "Net" }) do
-			local f = ReplicatedStorage:FindFirstChild(name)
-			if f then table.insert(folders, f) end
-		end
-
 		local function inspect(obj)
 			if obj:IsA("RemoteEvent") and obj:GetAttribute("Id") ~= nil then
 				Runtime.FoundRemote = obj
@@ -169,27 +171,24 @@ local function DiscoverRemotes()
 			end
 		end
 
-		for _, folder in ipairs(folders) do
-			for _, desc in ipairs(folder:GetDescendants()) do
-				inspect(desc)
+		for _, name in ipairs({ "Util", "Common", "Remotes", "Assets", "FX", "Net" }) do
+			local f = ReplicatedStorage:FindFirstChild(name)
+			if f then
+				for _, desc in ipairs(f:GetDescendants()) do inspect(desc) end
+				TrackConn(f.DescendantAdded:Connect(inspect))
 			end
-			TrackConn(folder.DescendantAdded:Connect(inspect))
 		end
 	end)
 end
 
 -- ============================================================================
---  QUEST & MOB TARGETING TABLE [VERIFY ON BUILD]
---  Add/adjust entries per sea as needed for your exact Blox Fruits build.
+--  QUEST, MOB & FRUIT SCANNER HELPERS [VERIFY ON BUILD]
 -- ============================================================================
 local QUEST_PROFILES = {
-	-- Sea 1 examples
-	{ Sea = 1, MinLv = 1,   MaxLv = 9,   QuestNpc = "Bandit Quest Giver", QuestId = 1, Mob = "Bandit",       QuestPos = Vector3.new(1059, 16, 1544),  MobPos = Vector3.new(1145, 17, 1632) },
-	{ Sea = 1, MinLv = 10,  MaxLv = 14,  QuestNpc = "Bandit Quest Giver", QuestId = 2, Mob = "Monkey",       QuestPos = Vector3.new(1059, 16, 1544),  MobPos = Vector3.new(-1598, 36, 153) },
-	-- Sea 2 examples
-	{ Sea = 2, MinLv = 700, MaxLv = 724, QuestNpc = "Area Master",        QuestId = 1, Mob = "Raider",       QuestPos = Vector3.new(-427, 73, 1836),   MobPos = Vector3.new(-746, 39, 2331) },
-	-- Sea 3 examples
-	{ Sea = 3, MinLv = 1500,MaxLv = 1524,QuestNpc = "Port Town Quest Giver",QuestId = 1,Mob = "Pirate Millionaire",QuestPos = Vector3.new(-290, 44, 5580),MobPos = Vector3.new(-46, 44, 5638) },
+	{ Sea = 1, MinLv = 1,    MaxLv = 9,    QuestNpc = "Bandit Quest Giver",       QuestId = 1, Mob = "Bandit",            QuestPos = Vector3.new(1059, 16, 1544),   MobPos = Vector3.new(1145, 17, 1632) },
+	{ Sea = 1, MinLv = 10,   MaxLv = 14,   QuestNpc = "Bandit Quest Giver",       QuestId = 2, Mob = "Monkey",            QuestPos = Vector3.new(1059, 16, 1544),   MobPos = Vector3.new(-1598, 36, 153) },
+	{ Sea = 2, MinLv = 700,  MaxLv = 724,  QuestNpc = "Area Master",              QuestId = 1, Mob = "Raider",            QuestPos = Vector3.new(-427, 73, 1836),    MobPos = Vector3.new(-746, 39, 2331) },
+	{ Sea = 3, MinLv = 1500, MaxLv = 1524, QuestNpc = "Port Town Quest Giver",    QuestId = 1, Mob = "Pirate Millionaire", QuestPos = Vector3.new(-290, 44, 5580),   MobPos = Vector3.new(-46, 44, 5638) },
 }
 
 local function ResolveQuestProfile()
@@ -232,7 +231,8 @@ local function FindBestMob(preferredName)
 			local nameMatch = (not preferredName) or (model.Name:lower():find(preferredName:lower(), 1, true) ~= nil)
 			if nameMatch then
 				local dist = (mHRP.Position - origin).Magnitude
-				local isBoss = CFG.BossPriority and (model.Name:lower():find("boss") ~= nil or model.Name:lower():find("admiral") ~= nil or model.Name:lower():find("king") ~= nil)
+				local lowName = model.Name:lower()
+				local isBoss = CFG.BossPriority and (lowName:find("boss", 1, true) or lowName:find("admiral", 1, true) or lowName:find("king", 1, true))
 				local score = dist - (isBoss and 400 or 0)
 				if score < bestScore then
 					bestScore = score
@@ -245,22 +245,58 @@ local function FindBestMob(preferredName)
 	end
 
 	if not bestModel and preferredName then
-		-- Fallback to any living enemy if preferred mob isn't currently spawned
 		return FindBestMob(nil)
 	end
 
 	return bestModel, bestHRP, bestHum
 end
 
+local function FindSpawnedFruitPart()
+	for _, obj in ipairs(workspace:GetChildren()) do
+		local n = obj.Name:lower()
+		if n:find("fruit", 1, true) then
+			if obj:IsA("BasePart") then return obj end
+			if obj:IsA("Model") then
+				return obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true)
+			end
+			if obj:IsA("Tool") then
+				return obj:FindFirstChild("Handle") or obj:FindFirstChildWhichIsA("BasePart", true)
+			end
+		end
+	end
+	return nil
+end
+
 -- ============================================================================
---  MOVEMENT, MOB GROUPING & POSITIONING
+--  MOVEMENT, AUTO-EQUIP & MOB GROUPING
 -- ============================================================================
+local function EnsureFarmToolEquipped()
+	if not CFG.AutoEquipTool then return end
+	local char = GetChar()
+	local hum = GetHumanoid()
+	local bp = LocalPlayer:FindFirstChild("Backpack")
+	if not char or not hum or not bp or hum.Health <= 0 then return end
+	if char:FindFirstChildOfClass("Tool") then return end
+
+	local chosen = nil
+	for _, t in ipairs(bp:GetChildren()) do
+		if t:IsA("Tool") then
+			chosen = t
+			if CFG.PreferredSlot ~= "" and t.Name:lower():find(CFG.PreferredSlot:lower(), 1, true) then
+				break
+			end
+		end
+	end
+	if chosen then
+		pcall(function() hum:EquipTool(chosen) end)
+	end
+end
+
 local function MoveToCFrame(targetCF)
 	local hrp = GetHRP()
 	local hum = GetHumanoid()
 	if not hrp or not hum or hum.Health <= 0 then return end
 
-	-- Smooth step interpolation to avoid jarring teleports while staying snappy
 	local current = hrp.CFrame
 	local dist = (targetCF.Position - current.Position).Magnitude
 	local nextCF = dist > 18 and current:Lerp(targetCF, math.clamp(18 / dist, 0.15, 0.85)) or targetCF
@@ -295,7 +331,7 @@ local function GroupNearbyMobs(anchorPos, targetName)
 end
 
 -- ============================================================================
---  COMBAT: FAST ATTACK (AURA), FRUIT M1, BUFFS & FLEE
+--  COMBAT, FRUITS, RAIDS & SERVER HOP
 -- ============================================================================
 local function CollectAttackTargets()
 	local hrp = GetHRP()
@@ -321,8 +357,7 @@ end
 local function PerformFastAttack()
 	local char = GetChar()
 	if not char then return end
-	local tool = char:FindFirstChildOfClass("Tool") or char:FindFirstChild("EquippedWeapon")
-	if not tool then return end
+	if not (char:FindFirstChildOfClass("Tool") or char:FindFirstChild("EquippedWeapon")) then return end
 
 	local targets = CollectAttackTargets()
 	if #targets == 0 then return end
@@ -362,19 +397,12 @@ local function PerformFastAttack()
 end
 
 local function GetEquippedOrOwnedFruit()
-	local char = GetChar()
-	if char then
-		for _, tool in ipairs(char:GetChildren()) do
-			if tool:IsA("Tool") and tool.ToolTip == "Blox Fruit" then
-				return tool
-			end
-		end
-	end
-	local bp = LocalPlayer:FindFirstChild("Backpack")
-	if bp then
-		for _, tool in ipairs(bp:GetChildren()) do
-			if tool:IsA("Tool") and tool.ToolTip == "Blox Fruit" then
-				return tool
+	for _, cont in ipairs({ GetChar(), LocalPlayer:FindFirstChild("Backpack") }) do
+		if cont then
+			for _, tool in ipairs(cont:GetChildren()) do
+				if tool:IsA("Tool") and tool.ToolTip == "Blox Fruit" then
+					return tool
+				end
 			end
 		end
 	end
@@ -390,9 +418,7 @@ local function FireFruitM1(voidMode)
 	if not remote or not remote:IsA("RemoteEvent") then return end
 
 	if voidMode then
-		pcall(function()
-			remote:FireServer(Vector3.new(9e30, 9e30, 9e30), 5, true)
-		end)
+		pcall(function() remote:FireServer(Vector3.new(9e30, 9e30, 9e30), 5, true) end)
 		return
 	end
 
@@ -403,20 +429,17 @@ local function FireFruitM1(voidMode)
 		local nHRP, nHum = IsValidLivingModel(npc)
 		if nHRP and nHum and (nHRP.Position - hrp.Position).Magnitude <= 500 then
 			local dir = (nHRP.Position - hrp.Position).Unit
-			pcall(function()
-				remote:FireServer(dir, 1, true)
-			end)
+			pcall(function() remote:FireServer(dir, 1, true) end)
 		end
 	end
 end
 
 local function StorePhysicalFruits()
-	if not CFG.AutoStoreFruit or not Runtime.CommF then return end
-	local containers = { GetChar(), LocalPlayer:FindFirstChild("Backpack") }
-	for _, cont in ipairs(containers) do
+	if not Runtime.CommF then return end
+	for _, cont in ipairs({ GetChar(), LocalPlayer:FindFirstChild("Backpack") }) do
 		if cont then
 			for _, item in ipairs(cont:GetChildren()) do
-				if item:IsA("Tool") and (item.Name:lower():find("fruit") or item.ToolTip == "Blox Fruit") then
+				if item:IsA("Tool") and (item.Name:lower():find("fruit", 1, true) or item.ToolTip == "Blox Fruit") then
 					pcall(function()
 						Runtime.CommF:InvokeServer("StoreFruit", item:GetAttribute("OriginalName") or item.Name, item)
 					end)
@@ -432,7 +455,7 @@ local function HasRaidChip()
 			for _, t in ipairs(cont:GetChildren()) do
 				if t:IsA("Tool") then
 					local n = t.Name:lower()
-					if n:find("chip") or n:find("micro") then
+					if n:find("chip", 1, true) or n:find("micro", 1, true) then
 						return true
 					end
 				end
@@ -446,14 +469,8 @@ local function TriggerRaidPedestal()
 	local map = workspace:FindFirstChild("Map")
 	if not map then return false end
 
-	local holder, btn
-	if WORLD_3 then
-		holder = map:FindFirstChild("Boat Castle")
-		btn = holder and holder:FindFirstChild("RaidSummon2")
-	elseif WORLD_2 then
-		holder = map:FindFirstChild("CircleIsland")
-		btn = holder and holder:FindFirstChild("RaidSummon2")
-	end
+	local holder = (WORLD_3 and map:FindFirstChild("Boat Castle")) or (WORLD_2 and map:FindFirstChild("CircleIsland"))
+	local btn = holder and holder:FindFirstChild("RaidSummon2")
 	if not btn then return false end
 
 	btn = btn:FindFirstChild("Button") or btn:FindFirstChild("Main") or btn
@@ -470,9 +487,6 @@ local function TriggerRaidPedestal()
 	return false
 end
 
--- ============================================================================
---  MOVEMENT & WORLD HELPERS (WITH CLEAN REVERT)
--- ============================================================================
 local function ApplyMovementState()
 	local hum = GetHumanoid()
 	if not hum or hum.Health <= 0 then return end
@@ -508,18 +522,17 @@ end
 
 local function SetWalkOnWater(enabled)
 	if not enabled then
-		for _, part in ipairs(Runtime.WaterParts) do
-			if part and part.Parent then pcall(function() part:Destroy() end) end
+		if Runtime.WaterPad and Runtime.WaterPad.Parent then
+			pcall(function() Runtime.WaterPad:Destroy() end)
 		end
-		table.clear(Runtime.WaterParts)
+		Runtime.WaterPad = nil
 		return
 	end
 
 	local hrp = GetHRP()
 	if not hrp then return end
 
-	-- Keep a single floating platform right under the player at sea level (Y ~ 0)
-	local pad = Runtime.WaterParts[1]
+	local pad = Runtime.WaterPad
 	if not pad or not pad.Parent then
 		pad = Instance.new("Part")
 		pad.Name = "ZyvoraWaterPad"
@@ -528,7 +541,7 @@ local function SetWalkOnWater(enabled)
 		pad.CanCollide = true
 		pad.Transparency = 1
 		pad.Parent = workspace
-		Runtime.WaterParts[1] = pad
+		Runtime.WaterPad = pad
 	end
 	pad.Position = Vector3.new(hrp.Position.X, -0.5, hrp.Position.Z)
 end
@@ -567,7 +580,6 @@ end
 -- ============================================================================
 DiscoverRemotes()
 
--- Main Farm Loop
 TrackThread(function()
 	local angle = 0
 	while Runtime.Alive do
@@ -583,7 +595,15 @@ TrackThread(function()
 				return
 			end
 
-			-- Low HP escape
+			if CFG.FruitScanner then
+				local fruitPart = FindSpawnedFruitPart()
+				if fruitPart then
+					SetStatus("Collecting spawned fruit...")
+					MoveToCFrame(CFrame.new(fruitPart.Position + Vector3.new(0, 2, 0)))
+					return
+				end
+			end
+
 			if CFG.AutoFleeLowHP then
 				local hpPct = (hum.Health / math.max(hum.MaxHealth, 1)) * 100
 				if hpPct <= CFG.FleeHPThreshold then
@@ -620,6 +640,7 @@ TrackThread(function()
 				return
 			end
 
+			EnsureFarmToolEquipped()
 			SetStatus("Farming: " .. mobModel.Name)
 			GroupNearbyMobs(mobHRP.Position, preferredMob)
 
@@ -628,8 +649,7 @@ TrackThread(function()
 				and Vector3.new(math.cos(angle) * CFG.FarmHeight, CFG.FarmHeight * 0.5, math.sin(angle) * CFG.FarmHeight)
 				or Vector3.new(0, CFG.FarmHeight, 0)
 
-			local desiredPos = mobHRP.Position + offset
-			MoveToCFrame(CFrame.lookAt(desiredPos, mobHRP.Position))
+			MoveToCFrame(CFrame.lookAt(mobHRP.Position + offset, mobHRP.Position))
 		end)
 
 		if not ok then
@@ -639,21 +659,18 @@ TrackThread(function()
 	end
 end)
 
--- Fast Attack / Aura Loop
 TrackThread(function()
 	while Runtime.Alive do
 		if CFG.FastAttack then
 			local t0 = os.clock()
 			pcall(PerformFastAttack)
-			local dt = os.clock() - t0
-			task.wait(math.max(CFG.AttackDelay - dt, 0.01))
+			task.wait(math.max(CFG.AttackDelay - (os.clock() - t0), 0.01))
 		else
 			task.wait(0.25)
 		end
 	end
 end)
 
--- Fruit M1 / Void Fruit M1 Loop
 TrackThread(function()
 	while Runtime.Alive do
 		if CFG.VoidFruitM1 then
@@ -668,7 +685,6 @@ TrackThread(function()
 	end
 end)
 
--- Buffs, Store Fruit & Raid Trigger Loop
 TrackThread(function()
 	while Runtime.Alive do
 		task.wait(1.2)
@@ -719,7 +735,6 @@ TrackThread(function()
 	end
 end)
 
--- Movement, Noclip & Water Pad Loop
 TrackConn(RunService.Stepped:Connect(function()
 	if not Runtime.Alive then return end
 	ApplyMovementState()
@@ -738,7 +753,6 @@ TrackConn(RunService.Stepped:Connect(function()
 	SetWalkOnWater(CFG.WalkOnWater)
 end))
 
--- Anti-AFK
 TrackConn(LocalPlayer.Idled:Connect(function()
 	if CFG.AntiAFK then
 		pcall(function()
@@ -749,7 +763,7 @@ TrackConn(LocalPlayer.Idled:Connect(function()
 end))
 
 -- ============================================================================
---  CLASSIC CRIMSON & BLACK UI (ZYVORA)
+--  CLASSIC CRIMSON & BLACK UI (ZYVORA FARM v1)
 -- ============================================================================
 local function GetGuiRoot()
 	if type(gethui) == "function" then
@@ -762,16 +776,15 @@ local function GetGuiRoot()
 end
 
 local THEME = {
-	Void         = Color3.fromRGB(8, 7, 9),
-	Panel        = Color3.fromRGB(16, 10, 13),
-	Card         = Color3.fromRGB(24, 13, 18),
-	CardHover    = Color3.fromRGB(34, 17, 24),
-	Crimson      = Color3.fromRGB(214, 24, 54),
-	CrimsonBright= Color3.fromRGB(255, 48, 82),
-	CrimsonDim   = Color3.fromRGB(92, 14, 28),
-	Text         = Color3.fromRGB(246, 240, 242),
-	Muted        = Color3.fromRGB(165, 142, 149),
-	Stroke       = Color3.fromRGB(120, 22, 38),
+	Void          = Color3.fromRGB(8, 7, 9),
+	Panel         = Color3.fromRGB(16, 10, 13),
+	Card          = Color3.fromRGB(24, 13, 18),
+	Crimson       = Color3.fromRGB(214, 24, 54),
+	CrimsonBright = Color3.fromRGB(255, 48, 82),
+	CrimsonDim    = Color3.fromRGB(92, 14, 28),
+	Text          = Color3.fromRGB(246, 240, 242),
+	Muted         = Color3.fromRGB(165, 142, 149),
+	Stroke        = Color3.fromRGB(120, 22, 38),
 }
 
 local function Make(class, props, parent)
@@ -792,14 +805,13 @@ local rootFrame = Make("Frame", {
 	Name = "MainWindow",
 	AnchorPoint = Vector2.new(0.5, 0.5),
 	Position = UDim2.fromScale(0.5, 0.5),
-	Size = UDim2.fromOffset(520, 380),
+	Size = UDim2.fromOffset(530, 390),
 	BackgroundColor3 = THEME.Panel,
 	BorderSizePixel = 0,
 }, screenGui)
 Make("UICorner", { CornerRadius = UDim.new(0, 12) }, rootFrame)
 Make("UIStroke", { Color = THEME.Crimson, Thickness = 1.5, Transparency = 0.2 }, rootFrame)
 
--- Top Bar (Crimson Gradient + Drag Handle)
 local topBar = Make("Frame", {
 	Size = UDim2.new(1, 0, 0, 44),
 	BackgroundColor3 = THEME.Void,
@@ -809,7 +821,7 @@ Make("UICorner", { CornerRadius = UDim.new(0, 12) }, topBar)
 Make("UIStroke", { Color = THEME.Stroke, Thickness = 1, Transparency = 0.35 }, topBar)
 
 Make("TextLabel", {
-	Size = UDim2.new(1, -130, 1, 0),
+	Size = UDim2.new(0, 155, 1, 0),
 	Position = UDim2.fromOffset(14, 0),
 	BackgroundTransparency = 1,
 	Text = "ZYVORA FARM v1",
@@ -820,8 +832,8 @@ Make("TextLabel", {
 }, topBar)
 
 local statusBadge = Make("TextLabel", {
-	Size = UDim2.new(0, 210, 1, 0),
-	Position = UDim2.new(1, -268, 0, 0),
+	Size = UDim2.new(0, 275, 1, 0),
+	Position = UDim2.new(1, -333, 0, 0),
 	BackgroundTransparency = 1,
 	Text = Runtime.StatusText,
 	Font = Enum.Font.GothamMedium,
@@ -881,19 +893,15 @@ do
 	end))
 end
 
--- Left Tab Rail
 local tabRail = Make("Frame", {
-	Size = UDim2.new(0, 126, 1, -54),
+	Size = UDim2.new(0, 128, 1, -54),
 	Position = UDim2.fromOffset(8, 50),
 	BackgroundColor3 = THEME.Void,
 	BorderSizePixel = 0,
 }, rootFrame)
 Make("UICorner", { CornerRadius = UDim.new(0, 8) }, tabRail)
 Make("UIStroke", { Color = THEME.Stroke, Thickness = 1, Transparency = 0.5 }, tabRail)
-Make("UIListLayout", {
-	Padding = UDim.new(0, 6),
-	SortOrder = Enum.SortOrder.LayoutOrder,
-}, tabRail)
+Make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, tabRail)
 Make("UIPadding", {
 	PaddingTop = UDim.new(0, 8),
 	PaddingBottom = UDim.new(0, 8),
@@ -901,10 +909,9 @@ Make("UIPadding", {
 	PaddingRight = UDim.new(0, 8),
 }, tabRail)
 
--- Content Area
 local contentArea = Make("Frame", {
-	Size = UDim2.new(1, -146, 1, -54),
-	Position = UDim2.fromOffset(140, 50),
+	Size = UDim2.new(1, -148, 1, -54),
+	Position = UDim2.fromOffset(142, 50),
 	BackgroundColor3 = THEME.Void,
 	BorderSizePixel = 0,
 }, rootFrame)
@@ -926,10 +933,7 @@ local function CreatePage(name, order)
 		Visible = false,
 	}, contentArea)
 
-	Make("UIListLayout", {
-		Padding = UDim.new(0, 6),
-		SortOrder = Enum.SortOrder.LayoutOrder,
-	}, page)
+	Make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, page)
 	Make("UIPadding", {
 		PaddingTop = UDim.new(0, 8),
 		PaddingBottom = UDim.new(0, 8),
@@ -942,7 +946,7 @@ local function CreatePage(name, order)
 		LayoutOrder = order,
 		BackgroundColor3 = THEME.Card,
 		Text = name,
-		Font = Enum.Font.GothamSemiBold,
+		Font = Enum.Font.GothamBold,
 		TextSize = 12,
 		TextColor3 = THEME.Muted,
 		AutoButtonColor = false,
@@ -962,6 +966,29 @@ local function CreatePage(name, order)
 	end))
 
 	return page
+end
+
+local function AddInfoCard(page, initialText)
+	local card = Make("Frame", {
+		Size = UDim2.new(1, 0, 0, 34),
+		BackgroundColor3 = THEME.Card,
+		BorderSizePixel = 0,
+	}, page)
+	Make("UICorner", { CornerRadius = UDim.new(0, 6) }, card)
+	Make("UIStroke", { Color = THEME.Crimson, Thickness = 1, Transparency = 0.5 }, card)
+
+	local lbl = Make("TextLabel", {
+		Size = UDim2.new(1, -16, 1, 0),
+		Position = UDim2.fromOffset(8, 0),
+		BackgroundTransparency = 1,
+		Text = initialText,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 11,
+		TextColor3 = THEME.Text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}, card)
+	return lbl
 end
 
 local function AddToggle(page, labelText, cfgKey, onChanged)
@@ -996,18 +1023,14 @@ local function AddToggle(page, labelText, cfgKey, onChanged)
 	}, row)
 	Make("UICorner", { CornerRadius = UDim.new(1, 0) }, pill)
 
-	local function Refresh()
+	TrackConn(pill.MouseButton1Click:Connect(function()
+		CFG[cfgKey] = not CFG[cfgKey]
 		local state = CFG[cfgKey]
 		pill.Text = state and "ON" or "OFF"
 		TweenService:Create(pill, TweenInfo.new(0.15), {
 			BackgroundColor3 = state and THEME.CrimsonBright or THEME.CrimsonDim,
 		}):Play()
-	end
-
-	TrackConn(pill.MouseButton1Click:Connect(function()
-		CFG[cfgKey] = not CFG[cfgKey]
-		Refresh()
-		if onChanged then pcall(onChanged, CFG[cfgKey]) end
+		if onChanged then pcall(onChanged, state) end
 	end))
 end
 
@@ -1016,7 +1039,7 @@ local function AddActionButton(page, labelText, onClick)
 		Size = UDim2.new(1, 0, 0, 34),
 		BackgroundColor3 = THEME.CrimsonDim,
 		Text = labelText,
-		Font = Enum.Font.GothamSemiBold,
+		Font = Enum.Font.GothamBold,
 		TextSize = 12,
 		TextColor3 = THEME.Text,
 		AutoButtonColor = false,
@@ -1029,24 +1052,24 @@ local function AddActionButton(page, labelText, onClick)
 	end))
 end
 
--- Build Tabs
 local pFarm   = CreatePage("Auto Farm", 1)
 local pCombat = CreatePage("Combat", 2)
 local pMove   = CreatePage("Movement", 3)
 local pWorld  = CreatePage("Hop & Misc", 4)
 
--- Tab 1: Auto Farm
+local telemetryCard = AddInfoCard(pFarm, "Sea 0 | Lv.1 | Uptime 00m:00s")
 AddToggle(pFarm, "Auto Farm Loop", "AutoFarm")
 AddToggle(pFarm, "Auto Quest Giver", "AutoQuest")
 AddToggle(pFarm, "Bring / Group Mobs", "BringMobs")
+AddToggle(pFarm, "Auto-Equip Farm Tool", "AutoEquipTool")
 AddToggle(pFarm, "Orbit Farm Mode (Off = Above)", "FarmMode", function(v)
 	CFG.FarmMode = v and "Orbit" or "Above"
 end)
 AddToggle(pFarm, "Boss Priority", "BossPriority")
 AddToggle(pFarm, "Skip Stuck Mobs", "SkipStuckMobs")
+AddToggle(pFarm, "Fruit Spawn Scanner", "FruitScanner")
 AddToggle(pFarm, "Auto Flee at Low HP", "AutoFleeLowHP")
 
--- Tab 2: Combat & Fruits
 AddToggle(pCombat, "Fast Attack / Aura", "FastAttack")
 AddToggle(pCombat, "Fruit M1", "FruitM1")
 AddToggle(pCombat, "Void Fruit M1", "VoidFruitM1")
@@ -1057,7 +1080,6 @@ AddToggle(pCombat, "Auto Race V4", "AutoV4")
 AddToggle(pCombat, "Auto Store Fruits", "AutoStoreFruit")
 AddToggle(pCombat, "Auto Trigger Raid Chip", "AutoRaidTrigger")
 
--- Tab 3: Movement
 AddToggle(pMove, "Custom WalkSpeed (" .. tostring(CFG.SpeedValue) .. ")", "SpeedEnabled", function(on)
 	if not on then RestoreMovementDefaults() end
 end)
@@ -1069,23 +1091,23 @@ AddToggle(pMove, "Walk On Water", "WalkOnWater", function(on)
 	if not on then SetWalkOnWater(false) end
 end)
 
--- Tab 4: Hop & Misc
 AddToggle(pWorld, "Anti-AFK", "AntiAFK")
 AddToggle(pWorld, "Avoid Visited Servers on Hop", "HopAvoidRepeats")
 AddActionButton(pWorld, "Smart Server Hop Now", SmartServerHop)
 AddActionButton(pWorld, "Store Inventory Fruits Now", StorePhysicalFruits)
 
--- Default active tab
 pFarm.Visible = true
 tabButtons["Auto Farm"].BackgroundColor3 = THEME.Crimson
 tabButtons["Auto Farm"].TextColor3 = THEME.Text
 
--- Status updater & Window controls
 TrackThread(function()
 	while Runtime.Alive do
 		task.wait(0.25)
 		if statusBadge and statusBadge.Parent then
 			statusBadge.Text = Runtime.StatusText
+		end
+		if telemetryCard and telemetryCard.Parent then
+			telemetryCard.Text = ("Sea %d | Lv.%d | Uptime %s"):format(GetCurrentSea(), GetPlayerLevel(), FormatUptime())
 		end
 	end
 end)
@@ -1095,18 +1117,14 @@ TrackConn(minBtn.MouseButton1Click:Connect(function()
 	minimized = not minimized
 	tabRail.Visible = not minimized
 	contentArea.Visible = not minimized
-	rootFrame.Size = minimized and UDim2.fromOffset(520, 44) or UDim2.fromOffset(520, 380)
+	rootFrame.Size = minimized and UDim2.fromOffset(530, 44) or UDim2.fromOffset(530, 390)
 end))
-
-local function SetUIVisible(v)
-	CFG.UIVisible = v
-	rootFrame.Visible = v
-end
 
 TrackConn(UserInputService.InputBegan:Connect(function(inp, gpe)
 	if gpe then return end
 	if inp.KeyCode == CFG.ToggleKey then
-		SetUIVisible(not CFG.UIVisible)
+		CFG.UIVisible = not CFG.UIVisible
+		rootFrame.Visible = CFG.UIVisible
 	end
 end))
 
