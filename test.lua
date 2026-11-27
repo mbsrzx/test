@@ -9,6 +9,7 @@ local UserInputService  = game:GetService("UserInputService")
 local VIM               = game:GetService("VirtualInputManager")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Lighting          = game:GetService("Lighting")
+local HttpService       = game:GetService("HttpService")
 
 local lp = Players.LocalPlayer
 
@@ -16,10 +17,23 @@ local World1 = game.PlaceId == 2753915549 or game.PlaceId == 85211729168715
 local World2 = game.PlaceId == 4442272183 or game.PlaceId == 79091703265657
 local World3 = game.PlaceId == 7449423635 or game.PlaceId == 100117331123089
 
+local CONFIG_DIR    = "test"
+local CONFIG_FILE   = CONFIG_DIR .. "/config.json"
+local CACHED_SCRIPT = CONFIG_DIR .. "/cached_test.lua"
+local AUTOEXEC_DIR  = "autoexec"
+local AUTOEXEC_FILE = AUTOEXEC_DIR .. "/test_AutoExec.lua"
+
 -- ================================================================
 --  CONFIG & STATE
 -- ================================================================
 local CFG = {
+    -- Screen-Share Proof & Soru Visual Cooldown (ON by default)
+    ScreenShareProof = true,
+    SoruVisualCD     = true,
+    -- Auto-Save & Auto-Exec (ON by default)
+    AutoSaveConfig   = true,
+    AutoExec         = true,
+    HostedScriptUrl  = "",
     -- Silent Aim
     SilentAimPlayers = false, SilentAimNPCs = false,
     FovRadius = 120, AimMaxRange = 1000,
@@ -96,7 +110,11 @@ local CFG = {
 local AIM = { pos = nil, rawPos = nil, gunPos = nil, soruPos = nil }
 local Whitelist = {}
 local toggleCallbacks = {}
+local uiSyncCallbacks = {}
 local OversizedPlayers = {}
+local _suppressAutoSave = false
+local _captureActive = false
+local _soruFakeCdStart = tick()
 
 local KB = {
     ToggleUI         = Enum.KeyCode.RightShift,
@@ -119,6 +137,187 @@ local SLOT_TO_KEYCODE = {
     ["9"] = Enum.KeyCode.Nine,
     ["0"] = Enum.KeyCode.Zero,
 }
+
+-- ================================================================
+--  CONFIG PERSISTENCE, AUTO-EXEC & CAPTURE SIGNALS
+-- ================================================================
+local function ensureFolder(path)
+    if type(isfolder) == "function" and type(makefolder) == "function" then
+        if not isfolder(path) then
+            pcall(makefolder, path)
+        end
+    end
+end
+
+local function serializeValue(val)
+    local t = typeof(val)
+    if t == "EnumItem" then
+        return { __enumType = tostring(val.EnumType), name = val.Name }
+    elseif type(val) == "table" then
+        local copy = {}
+        for k, v in pairs(val) do
+            copy[k] = serializeValue(v)
+        end
+        return copy
+    end
+    return val
+end
+
+local function deserializeValue(val, fallback)
+    if type(val) == "table" and val.__enumType and val.name then
+        local enumContainer = Enum[tostring(val.__enumType)]
+        if enumContainer and enumContainer[val.name] then
+            return enumContainer[val.name]
+        end
+        return fallback
+    elseif type(val) == "string" and typeof(fallback) == "EnumItem" then
+        local enumContainer = Enum[tostring(fallback.EnumType)]
+        if enumContainer and enumContainer[val] then
+            return enumContainer[val]
+        end
+        return fallback
+    elseif type(val) == "table" and type(fallback) == "table" then
+        local merged = {}
+        for k, fb in pairs(fallback) do
+            merged[k] = val[k] ~= nil and deserializeValue(val[k], fb) or fb
+        end
+        for k, v in pairs(val) do
+            if merged[k] == nil then
+                merged[k] = v
+            end
+        end
+        return merged
+    end
+    return val
+end
+
+local function saveConfigFile(silent)
+    if type(writefile) ~= "function" then
+        if not silent then warn("[test] writefile is not supported in this executor.") end
+        return false
+    end
+    local ok, err = pcall(function()
+        ensureFolder(CONFIG_DIR)
+        local serializedCfg = {}
+        for k, v in pairs(CFG) do
+            serializedCfg[k] = serializeValue(v)
+        end
+        writefile(CONFIG_FILE, HttpService:JSONEncode({
+            CFG = serializedCfg,
+            Whitelist = Whitelist,
+        }))
+    end)
+    if not ok then
+        warn("[test] Config save error: " .. tostring(err))
+        return false
+    end
+    if not silent then
+        print("[test] Saved config to " .. CONFIG_FILE)
+    end
+    return true
+end
+
+local _saveQueued = false
+local function scheduleAutoSave()
+    if _suppressAutoSave or not CFG.AutoSaveConfig or _saveQueued then return end
+    _saveQueued = true
+    task.delay(0.3, function()
+        _saveQueued = false
+        if CFG.AutoSaveConfig and not _suppressAutoSave then
+            saveConfigFile(true)
+        end
+    end)
+end
+
+local function buildAutoExecLoader()
+    local url = tostring(CFG.HostedScriptUrl or ""):gsub('"', '\\"')
+    return table.concat({
+        "-- test AutoExec bootstrapper",
+        "repeat task.wait() until game:IsLoaded()",
+        "task.wait(1)",
+        'if type(isfile) == "function" and type(readfile) == "function" and isfile("' .. CACHED_SCRIPT .. '") then',
+        '    local fn, err = loadstring(readfile("' .. CACHED_SCRIPT .. '"))',
+        "    if fn then task.spawn(fn) else warn('[test AutoExec] ' .. tostring(err)) end",
+        'elseif "' .. url .. '" ~= "" then',
+        '    local ok, src = pcall(function() return game:HttpGet("' .. url .. '") end)',
+        "    if ok and type(src) == 'string' and #src > 0 then",
+        "        local fn, err = loadstring(src)",
+        "        if fn then task.spawn(fn) else warn('[test AutoExec] ' .. tostring(err)) end",
+        "    end",
+        "else",
+        '    warn("[test AutoExec] Cache missing at ' .. CACHED_SCRIPT .. '. Copy script & click Cache Clipboard in Config tab.")',
+        "end",
+    }, "\n")
+end
+
+local function syncAutoExec(enabled)
+    if type(writefile) ~= "function" then
+        warn("[test] writefile not available; cannot write autoexec file.")
+        return false
+    end
+    local ok, err = pcall(function()
+        if enabled then
+            ensureFolder(CONFIG_DIR)
+            ensureFolder(AUTOEXEC_DIR)
+            writefile(AUTOEXEC_FILE, buildAutoExecLoader())
+        else
+            if type(isfile) == "function" and type(delfile) == "function" and isfile(AUTOEXEC_FILE) then
+                delfile(AUTOEXEC_FILE)
+            end
+        end
+    end)
+    if not ok then
+        warn("[test] AutoExec sync error: " .. tostring(err))
+        return false
+    end
+    return true
+end
+
+local function cacheScriptFromClipboard()
+    local getClip = getclipboard or fromclipboard
+    if type(getClip) ~= "function" or type(writefile) ~= "function" then
+        warn("[test] Executor missing getclipboard or writefile.")
+        return false
+    end
+    local ok, clip = pcall(getClip)
+    if not ok or type(clip) ~= "string" or #clip < 200 or not clip:find("WindUI", 1, true) then
+        warn("[test] Clipboard does not contain the full script source.")
+        return false
+    end
+    ensureFolder(CONFIG_DIR)
+    writefile(CACHED_SCRIPT, clip)
+    if CFG.AutoExec then
+        syncAutoExec(true)
+    end
+    print("[test] Cached script to " .. CACHED_SCRIPT .. " (" .. #clip .. " bytes)")
+    return true
+end
+
+lp.OnTeleport:Connect(function()
+    if not CFG.AutoExec then return end
+    local qot = queue_on_teleport
+        or (syn and syn.queue_on_teleport)
+        or (fluxus and fluxus.queue_on_teleport)
+    if type(qot) == "function" then
+        pcall(qot, buildAutoExecLoader())
+    end
+end)
+
+task.spawn(function()
+    pcall(function()
+        local cap = game:GetService("CaptureService")
+        if cap and cap.ScreenshotCaptured then
+            cap.ScreenshotCaptured:Connect(function()
+                if CFG.ScreenShareProof then _captureActive = true end
+            end)
+        end
+        if cap and cap.CaptureEnded then
+            cap.CaptureEnded:Connect(function()
+                _captureActive = false
+            end)
+        end
+    end)
+end)
 
 -- ================================================================
 --  HELPERS
@@ -428,7 +627,7 @@ Players.PlayerAdded:Connect(hookPlayer)
 Players.PlayerRemoving:Connect(unhookPlayer)
 
 -- ================================================================
---  SORU & AUTO SORU
+--  SORU, VISIBLE ICON COOLDOWN & AUTO SORU
 -- ================================================================
 local _soruAttrConn = nil
 local autoSoruThread = nil
@@ -482,10 +681,38 @@ if lp.Character then
 end
 
 task.spawn(function()
+    local cycleDuration = 4.0
     while true do
-        task.wait(0.5)
+        task.wait(0.08)
         if CFG.SoruInfinite and lp.Character then
             pcall(function() lp.Character:SetAttribute("FlashstepCooldown", 1) end)
+        end
+        if CFG.SoruInfinite and CFG.SoruVisualCD then
+            pcall(function()
+                local pg = lp:FindFirstChild("PlayerGui")
+                local main = pg and pg:FindFirstChild("Main")
+                if not main then return end
+                local elapsed = (tick() - _soruFakeCdStart) % cycleDuration
+                local frac = math.clamp(1 - (elapsed / cycleDuration), 0.05, 1)
+                local secsLeft = math.max(1, math.ceil((1 - (elapsed / cycleDuration)) * cycleDuration))
+                for _, desc in ipairs(main:GetDescendants()) do
+                    local n = desc.Name:lower()
+                    if n:find("soru", 1, true) or n:find("flashstep", 1, true) then
+                        local cdFrame = desc:FindFirstChild("Cooldown", true)
+                        if cdFrame and cdFrame:IsA("GuiObject") then
+                            cdFrame.Visible = true
+                            if cdFrame:IsA("Frame") then
+                                cdFrame.Size = UDim2.new(cdFrame.Size.X.Scale, cdFrame.Size.X.Offset, frac, 0)
+                            end
+                        end
+                        local cdLabel = desc:FindFirstChildWhichIsA("TextLabel", true)
+                        if cdLabel then
+                            cdLabel.Text = tostring(secsLeft) .. "s"
+                            cdLabel.Visible = true
+                        end
+                    end
+                end
+            end)
         end
     end
 end)
@@ -825,7 +1052,6 @@ local function stepExperimentalFeatures(dt)
     local base = myHRP()
     local myHum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
 
-    -- 2. Oversized Avatar Flag ( experimental )
     if CFG.ExpAvatarSizeFlag then
         for _, pl in ipairs(Players:GetPlayers()) do
             if pl ~= lp and pl.Character then
@@ -844,7 +1070,6 @@ local function stepExperimentalFeatures(dt)
 
     if not base or not myHum or myHum.Health <= 0 then return end
 
-    -- 1. Aura Shell Orbit ( experimental )
     if CFG.ExpAuraShellOrbit then
         local cp = getClosestPlayer(160, 400)
         local tHRP = cp and cp:FindFirstChild("HumanoidRootPart")
@@ -861,7 +1086,6 @@ local function stepExperimentalFeatures(dt)
         end
     end
 
-    -- 3. Fly Down-Draft Nudger ( experimental )
     if CFG.ExpFlyDownDraft then
         for _, pl in ipairs(Players:GetPlayers()) do
             if pl ~= lp and isEnemy(pl) and pl.Character then
@@ -880,7 +1104,6 @@ local function stepExperimentalFeatures(dt)
         end
     end
 
-    -- 9. Second-Flyer Spacing ( experimental )
     if CFG.ExpSecondFlyerSpace then
         local nearCount = 0
         local pushDir = Vector3.zero
@@ -1616,13 +1839,14 @@ RunService.Heartbeat:Connect(function(dt)
     _tick = _tick + dt; if _tick < 0.033 then return end; _tick = 0
     local ctr = getFovCentre()
     local mouseLoc = UserInputService:GetMouseLocation()
+    local overlayAllowed = CFG.UIVisible and not (CFG.ScreenShareProof and _captureActive)
     if FOVCircle then
         FOVCircle.Position = ctr; FOVCircle.Radius = CFG.FovRadius
-        FOVCircle.Visible = CFG.UIVisible and (CFG.SilentAimPlayers or CFG.SilentAimNPCs or CFG.SoruAim)
+        FOVCircle.Visible = overlayAllowed and (CFG.SilentAimPlayers or CFG.SilentAimNPCs or CFG.SoruAim)
     end
     if GunFOVCircle then
         GunFOVCircle.Position = mouseLoc; GunFOVCircle.Radius = CFG.GunFovRadius
-        GunFOVCircle.Visible = CFG.UIVisible and CFG.GunAim
+        GunFOVCircle.Visible = overlayAllowed and CFG.GunAim
     end
     if CFG.AutoKen then
         local base = myHRP()
@@ -1748,6 +1972,7 @@ task.spawn(function()
             end
 
             if isSoruCall then
+                _soruFakeCdStart = tick()
                 if CFG.SoruFollowup then
                     fireSoruFollowup()
                 elseif CFG.StackUD then
@@ -1863,6 +2088,7 @@ local function addCfgToggle(tab, cfgKey, title, desc, onChanged)
         Callback = function(state)
             CFG[cfgKey] = state
             if onChanged then onChanged(state) end
+            scheduleAutoSave()
         end,
     })
     toggleCallbacks[cfgKey] = function()
@@ -1872,8 +2098,90 @@ local function addCfgToggle(tab, cfgKey, title, desc, onChanged)
             pcall(function() tgl:Set(nextVal) end)
         end
         if onChanged then onChanged(nextVal) end
+        scheduleAutoSave()
+    end
+    uiSyncCallbacks[cfgKey] = function()
+        if tgl and tgl.Set then pcall(function() tgl:Set(CFG[cfgKey]) end) end
+        if onChanged then pcall(onChanged, CFG[cfgKey]) end
     end
     return tgl
+end
+
+local function addCfgSlider(tab, cfgKey, title, step, minVal, maxVal, onChanged)
+    local sld = tab:Slider({
+        Title = title,
+        Step = step,
+        Value = { Min = minVal, Max = maxVal, Default = CFG[cfgKey] },
+        Callback = function(v)
+            CFG[cfgKey] = v
+            if onChanged then onChanged(v) end
+            scheduleAutoSave()
+        end,
+    })
+    uiSyncCallbacks[cfgKey] = function()
+        if sld and sld.Set then pcall(function() sld:Set(CFG[cfgKey]) end) end
+        if onChanged then pcall(onChanged, CFG[cfgKey]) end
+    end
+    return sld
+end
+
+local function addCfgDropdown(tab, cfgKey, title, values, onChanged)
+    local dd = tab:Dropdown({
+        Title = title,
+        Values = values,
+        Value = CFG[cfgKey],
+        Callback = function(v)
+            CFG[cfgKey] = v
+            if onChanged then onChanged(v) end
+            scheduleAutoSave()
+        end,
+    })
+    uiSyncCallbacks[cfgKey] = function()
+        if dd then
+            if dd.Set then pcall(function() dd:Set(CFG[cfgKey]) end)
+            elseif dd.Select then pcall(function() dd:Select(CFG[cfgKey]) end) end
+        end
+        if onChanged then pcall(onChanged, CFG[cfgKey]) end
+    end
+    return dd
+end
+
+local function syncAllUIFromConfig()
+    _suppressAutoSave = true
+    for _, fn in pairs(uiSyncCallbacks) do
+        pcall(fn)
+    end
+    _suppressAutoSave = false
+end
+
+local function loadConfigFile(silent)
+    if type(readfile) ~= "function" or type(isfile) ~= "function" or not isfile(CONFIG_FILE) then
+        if not silent then warn("[test] No saved config file at " .. CONFIG_FILE) end
+        return false
+    end
+    local ok, err = pcall(function()
+        local decoded = HttpService:JSONDecode(readfile(CONFIG_FILE))
+        if type(decoded) ~= "table" then return end
+        local rawCfg = type(decoded.CFG) == "table" and decoded.CFG or decoded
+        for k, fb in pairs(CFG) do
+            if rawCfg[k] ~= nil then
+                CFG[k] = deserializeValue(rawCfg[k], fb)
+            end
+        end
+        CFG.UIVisible = true
+        if type(decoded.Whitelist) == "table" then
+            Whitelist = decoded.Whitelist
+        end
+    end)
+    if not ok then
+        warn("[test] Config load error: " .. tostring(err))
+        return false
+    end
+    syncAllUIFromConfig()
+    if not silent then
+        print("[test] Loaded config from " .. CONFIG_FILE)
+    end
+    return true
 end
 
 -- Tabs
@@ -1890,129 +2198,63 @@ local tESP     = Window:Tab({ Title = "ESP",               Icon = "eye" })
 local tTP      = Window:Tab({ Title = "TP / Hop",          Icon = "navigation" })
 local tKen     = Window:Tab({ Title = "Auto Ken",          Icon = "shield" })
 local tWL      = Window:Tab({ Title = "Whitelist",         Icon = "user-check" })
+local tConfig  = Window:Tab({ Title = "Config",            Icon = "save" })
 
 -- AIM TAB
 tAim:Section({ Title = "Silent Aim" })
 addCfgToggle(tAim, "SilentAimPlayers", "Silent Aim Players [F1]", "Redirects remote position args on enemy players")
 addCfgToggle(tAim, "SilentAimNPCs",    "Silent Aim NPCs [F2]",    "Redirects remote position args on NPCs/mobs")
-tAim:Dropdown({
-    Title = "Target Part",
-    Values = { "HumanoidRootPart", "Head", "UpperTorso", "LowerTorso" },
-    Value = CFG.HitPart,
-    Callback = function(v) CFG.HitPart = v end,
-})
-tAim:Dropdown({
-    Title = "FOV Origin",
-    Values = { "Mouse", "Centre" },
-    Value = CFG.FovCentre and "Centre" or "Mouse",
-    Callback = function(v) CFG.FovCentre = (v == "Centre") end,
-})
-tAim:Slider({
-    Title = "FOV Radius",
-    Step = 1,
-    Value = { Min = 10, Max = 500, Default = CFG.FovRadius },
-    Callback = function(v) CFG.FovRadius = v end,
-})
-tAim:Slider({
-    Title = "Max Range (studs)",
-    Step = 10,
-    Value = { Min = 100, Max = 5000, Default = CFG.AimMaxRange },
-    Callback = function(v) CFG.AimMaxRange = v end,
-})
+addCfgDropdown(tAim, "HitPart", "Target Part", { "HumanoidRootPart", "Head", "UpperTorso", "LowerTorso" })
+do
+    local fovDD = tAim:Dropdown({
+        Title = "FOV Origin",
+        Values = { "Mouse", "Centre" },
+        Value = CFG.FovCentre and "Centre" or "Mouse",
+        Callback = function(v)
+            CFG.FovCentre = (v == "Centre")
+            scheduleAutoSave()
+        end,
+    })
+    uiSyncCallbacks["FovCentre"] = function()
+        local label = CFG.FovCentre and "Centre" or "Mouse"
+        if fovDD then
+            if fovDD.Set then pcall(function() fovDD:Set(label) end)
+            elseif fovDD.Select then pcall(function() fovDD:Select(label) end) end
+        end
+    end
+end
+addCfgSlider(tAim, "FovRadius",   "FOV Radius",        1,  10,  500)
+addCfgSlider(tAim, "AimMaxRange", "Max Range (studs)", 10, 100, 5000)
 
 tAim:Section({ Title = "Prediction & Offset" })
-tAim:Slider({
-    Title = "Vel X/Z",
-    Step = 0.01,
-    Value = { Min = 0, Max = 1, Default = CFG.VelX },
-    Callback = function(v) CFG.VelX = v end,
-})
-tAim:Slider({
-    Title = "Vel Y",
-    Step = 0.01,
-    Value = { Min = 0, Max = 1, Default = CFG.VelY },
-    Callback = function(v) CFG.VelY = v end,
-})
-tAim:Slider({
-    Title = "Offset X",
-    Step = 0.5,
-    Value = { Min = -15, Max = 15, Default = CFG.OffsetX },
-    Callback = function(v) CFG.OffsetX = v end,
-})
-tAim:Slider({
-    Title = "Offset Y",
-    Step = 0.5,
-    Value = { Min = -15, Max = 15, Default = CFG.OffsetY },
-    Callback = function(v) CFG.OffsetY = v end,
-})
-tAim:Slider({
-    Title = "Offset Z",
-    Step = 0.5,
-    Value = { Min = -15, Max = 15, Default = CFG.OffsetZ },
-    Callback = function(v) CFG.OffsetZ = v end,
-})
+addCfgSlider(tAim, "VelX",    "Vel X/Z",  0.01, 0,   1)
+addCfgSlider(tAim, "VelY",    "Vel Y",    0.01, 0,   1)
+addCfgSlider(tAim, "OffsetX", "Offset X", 0.5,  -15, 15)
+addCfgSlider(tAim, "OffsetY", "Offset Y", 0.5,  -15, 15)
+addCfgSlider(tAim, "OffsetZ", "Offset Z", 0.5,  -15, 15)
 
 -- GUN TAB
 tGun:Section({ Title = "Gun Aimbot" })
 addCfgToggle(tGun, "GunAim", "Gun Aimbot", "Redirects mouse.Hit to closest target in gun FOV")
-tGun:Slider({
-    Title = "Gun FOV Radius",
-    Step = 1,
-    Value = { Min = 10, Max = 500, Default = CFG.GunFovRadius },
-    Callback = function(v) CFG.GunFovRadius = v end,
-})
-tGun:Slider({
-    Title = "Gun Max Range (studs)",
-    Step = 10,
-    Value = { Min = 100, Max = 5000, Default = CFG.GunMaxRange },
-    Callback = function(v) CFG.GunMaxRange = v end,
-})
+addCfgSlider(tGun, "GunFovRadius", "Gun FOV Radius",        1,  10,  500)
+addCfgSlider(tGun, "GunMaxRange",  "Gun Max Range (studs)", 10, 100, 5000)
 
 -- SORU TAB
 tSoru:Section({ Title = "Soru & Flashstep" })
 addCfgToggle(tSoru, "SoruAim",      "Soru Aim [F3]",      "Targets closest player in FOV via mouse.Hit")
 addCfgToggle(tSoru, "SoruInfinite", "Infinite Soru [F4]", "Keeps FlashstepCooldown at 1")
+addCfgToggle(tSoru, "SoruVisualCD", "Visible Soru Icon Cooldown", "Keeps a visual cooldown indicator on the Soru icon during Infinite Soru")
 addCfgToggle(tSoru, "SoruDistance", "Soru Distance Boost","Extends Soru/Flashstep distance")
-tSoru:Slider({
-    Title = "Distance Multiplier",
-    Step = 0.1,
-    Value = { Min = 1, Max = 5, Default = CFG.SoruDistMult },
-    Callback = function(v) CFG.SoruDistMult = v end,
-})
+addCfgSlider(tSoru, "SoruDistMult", "Distance Multiplier", 0.1, 1, 5)
 
 tSoru:Section({ Title = "Stack UD & Follow-up" })
 addCfgToggle(tSoru, "StackUD", "Stack UD", "Vertical CFrame hop on Soru/skills")
-tSoru:Slider({
-    Title = "Stack Height",
-    Step = 1,
-    Value = { Min = 2, Max = 20, Default = CFG.StackUDHeight },
-    Callback = function(v) CFG.StackUDHeight = v end,
-})
-tSoru:Slider({
-    Title = "Stack Speed (s)",
-    Step = 0.01,
-    Value = { Min = 0.01, Max = 0.15, Default = CFG.StackUDSpeed },
-    Callback = function(v) CFG.StackUDSpeed = v end,
-})
+addCfgSlider(tSoru, "StackUDHeight", "Stack Height",    1,    2,    20)
+addCfgSlider(tSoru, "StackUDSpeed",  "Stack Speed (s)", 0.01, 0.01, 0.15)
 addCfgToggle(tSoru, "SoruFollowup", "Follow-up Combo", "Switches to configured category slot & fires follow-up skill after Soru")
-tSoru:Slider({
-    Title = "Trigger Delay (s)",
-    Step = 0.01,
-    Value = { Min = 0, Max = 0.5, Default = CFG.FollowupDelay },
-    Callback = function(v) CFG.FollowupDelay = v end,
-})
-tSoru:Slider({
-    Title = "Slot Equip Delay (s)",
-    Step = 0.01,
-    Value = { Min = 0.02, Max = 0.4, Default = CFG.FollowupSlotDelay },
-    Callback = function(v) CFG.FollowupSlotDelay = v end,
-})
-tSoru:Slider({
-    Title = "Step Gap (s)",
-    Step = 0.01,
-    Value = { Min = 0.02, Max = 0.5, Default = CFG.FollowupStepGap },
-    Callback = function(v) CFG.FollowupStepGap = v end,
-})
+addCfgSlider(tSoru, "FollowupDelay",     "Trigger Delay (s)",    0.01, 0,    0.5)
+addCfgSlider(tSoru, "FollowupSlotDelay", "Slot Equip Delay (s)", 0.01, 0.02, 0.4)
+addCfgSlider(tSoru, "FollowupStepGap",   "Step Gap (s)",         0.01, 0.02, 0.5)
 tSoru:Button({
     Title = "Trigger Follow-Up Now",
     Desc = "Manually runs [Selected Slot] -> [Follow-up Skill]",
@@ -2027,50 +2269,32 @@ end)
 -- LOADOUT TAB
 tLoadout:Section({ Title = "Weapon Hotbar Slots (1-9, 0)" })
 local slotChoices = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0" }
-tLoadout:Dropdown({
-    Title = "Devil Fruit Slot",
-    Values = slotChoices,
-    Value = CFG.LoadoutSlots.Fruit,
-    Callback = function(v) CFG.LoadoutSlots.Fruit = v end,
-})
-tLoadout:Dropdown({
-    Title = "Melee Slot",
-    Values = slotChoices,
-    Value = CFG.LoadoutSlots.Melee,
-    Callback = function(v) CFG.LoadoutSlots.Melee = v end,
-})
-tLoadout:Dropdown({
-    Title = "Sword Slot",
-    Values = slotChoices,
-    Value = CFG.LoadoutSlots.Sword,
-    Callback = function(v) CFG.LoadoutSlots.Sword = v end,
-})
-tLoadout:Dropdown({
-    Title = "Gun Slot",
-    Values = slotChoices,
-    Value = CFG.LoadoutSlots.Gun,
-    Callback = function(v) CFG.LoadoutSlots.Gun = v end,
-})
+local function addSlotDropdown(catKey, title)
+    local dd = tLoadout:Dropdown({
+        Title = title,
+        Values = slotChoices,
+        Value = CFG.LoadoutSlots[catKey],
+        Callback = function(v)
+            CFG.LoadoutSlots[catKey] = v
+            scheduleAutoSave()
+        end,
+    })
+    uiSyncCallbacks["Slot_" .. catKey] = function()
+        if dd then
+            if dd.Set then pcall(function() dd:Set(CFG.LoadoutSlots[catKey]) end)
+            elseif dd.Select then pcall(function() dd:Select(CFG.LoadoutSlots[catKey]) end) end
+        end
+    end
+end
+addSlotDropdown("Fruit", "Devil Fruit Slot")
+addSlotDropdown("Melee", "Melee Slot")
+addSlotDropdown("Sword", "Sword Slot")
+addSlotDropdown("Gun",   "Gun Slot")
 
 tLoadout:Section({ Title = "Follow-Up Category & Skill" })
-tLoadout:Dropdown({
-    Title = "Follow-Up Weapon Category",
-    Values = { "Fruit", "Sword", "Melee", "Gun" },
-    Value = CFG.FollowupCategory,
-    Callback = function(v) CFG.FollowupCategory = v end,
-})
-tLoadout:Dropdown({
-    Title = "Follow-Up Skill Move",
-    Values = { "Z", "X", "C", "V", "F" },
-    Value = CFG.FollowupSkill,
-    Callback = function(v) CFG.FollowupSkill = v end,
-})
-tLoadout:Dropdown({
-    Title = "Manual Follow-Up Keybind",
-    Values = { "None", "T", "R", "F", "G", "V", "B" },
-    Value = CFG.FollowupTriggerKey,
-    Callback = function(v) CFG.FollowupTriggerKey = v end,
-})
+addCfgDropdown(tLoadout, "FollowupCategory",   "Follow-Up Weapon Category", { "Fruit", "Sword", "Melee", "Gun" })
+addCfgDropdown(tLoadout, "FollowupSkill",      "Follow-Up Skill Move",      { "Z", "X", "C", "V", "F" })
+addCfgDropdown(tLoadout, "FollowupTriggerKey", "Manual Follow-Up Keybind",  { "None", "T", "R", "F", "G", "V", "B" })
 tLoadout:Button({
     Title = "Test Follow-Up Sequence",
     Desc = "Presses configured slot number then skill key",
@@ -2079,12 +2303,7 @@ tLoadout:Button({
 
 -- AURA TAB
 tAura:Section({ Title = "Fast Attack" })
-tAura:Dropdown({
-    Title = "Attack Mode",
-    Values = { "Mode1", "Mode2" },
-    Value = CFG.FastAttackMode,
-    Callback = function(v) CFG.FastAttackMode = v end,
-})
+addCfgDropdown(tAura, "FastAttackMode", "Attack Mode", { "Mode1", "Mode2" })
 addCfgToggle(tAura, "FastAttackMobs",    "Fast Attack Mobs",    "Hits nearby NPCs/mobs")
 addCfgToggle(tAura, "FastAttackPlayers", "Fast Attack Players", "Hits nearby players")
 
@@ -2099,28 +2318,17 @@ tAura:Section({ Title = "Auto Flee" })
 addCfgToggle(tAura, "AutoFlee", "Auto Flee (Raid)", "Triggers raid summon when HP is low", function(on)
     if on then startAutoFlee() else stopAutoFlee() end
 end)
-tAura:Slider({
-    Title = "Flee HP %",
-    Step = 1,
-    Value = { Min = 1, Max = 100, Default = CFG.AutoFleeHP },
-    Callback = function(v) CFG.AutoFleeHP = v end,
-})
+addCfgSlider(tAura, "AutoFleeHP", "Flee HP %", 1, 1, 100)
 
 -- MOVE TAB
 tMove:Section({ Title = "Speed & Jump" })
 addCfgToggle(tMove, "SpeedEnabled", "Speed Hack", "Overrides Humanoid WalkSpeed", function(on) if on then startSpeed() else stopSpeed() end end)
-tMove:Slider({
-    Title = "Walk Speed",
-    Step = 1,
-    Value = { Min = 1, Max = 2000, Default = CFG.SpeedValue },
-    Callback = function(v)
-        CFG.SpeedValue = v
-        if CFG.SpeedEnabled and lp.Character then
-            local hum = lp.Character:FindFirstChildOfClass("Humanoid")
-            if hum then hum.WalkSpeed = v end
-        end
-    end,
-})
+addCfgSlider(tMove, "SpeedValue", "Walk Speed", 1, 1, 2000, function(v)
+    if CFG.SpeedEnabled and lp.Character then
+        local hum = lp.Character:FindFirstChildOfClass("Humanoid")
+        if hum then hum.WalkSpeed = v end
+    end
+end)
 addCfgToggle(tMove, "JumpEnabled", "High Jump", "Overrides JumpPower / JumpHeight", function(on)
     local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
     if hum then
@@ -2128,31 +2336,23 @@ addCfgToggle(tMove, "JumpEnabled", "High Jump", "Overrides JumpPower / JumpHeigh
         elseif hum.UseJumpPower then hum.JumpPower = 50 else hum.JumpHeight = 7.2 end
     end
 end)
-tMove:Slider({
-    Title = "Jump Power / Height",
-    Step = 1,
-    Value = { Min = 50, Max = 500, Default = CFG.JumpValue },
-    Callback = function(v) CFG.JumpValue = v end,
-})
+addCfgSlider(tMove, "JumpValue", "Jump Power / Height", 1, 50, 500, function()
+    if CFG.JumpEnabled and lp.Character then
+        local hum = lp.Character:FindFirstChildOfClass("Humanoid")
+        if hum then updateJump(hum) end
+    end
+end)
 addCfgToggle(tMove, "InfiniteJump", "Infinite Jump", "Resets Skyjump cooldowns", function(on) if on then SJ.StartLoop() end end)
 
 tMove:Section({ Title = "Noclip, Fly, Dash & Water" })
 addCfgToggle(tMove, "Noclip", "Noclip", "Disables character part collisions", function(on) if on then startNoclip() else stopNoclip() end end)
 addCfgToggle(tMove, "FlyEnabled", "Fly", "LinearVelocity flight", function(on) if on then startFly() else stopFly() end end)
-tMove:Slider({
-    Title = "Fly Speed",
-    Step = 1,
-    Value = { Min = 1, Max = 500, Default = CFG.FlySpeed },
-    Callback = function(v) CFG.FlySpeed = v end,
-})
+addCfgSlider(tMove, "FlySpeed", "Fly Speed", 1, 1, 500)
 addCfgToggle(tMove, "DodgeNoCooldown", "Dodge No Cooldown", "Zeroes Dodge cooldown upvalue", function(on) if on then startDashNoCooldown() end end)
 addCfgToggle(tMove, "DashLengthEnabled", "Dash Length Override", "Sets DashLength attributes", function() manageDashLength() end)
-tMove:Slider({
-    Title = "Dash Length",
-    Step = 1,
-    Value = { Min = 1, Max = 20, Default = CFG.DashLength },
-    Callback = function(v) CFG.DashLength = v; if CFG.DashLengthEnabled then manageDashLength() end end,
-})
+addCfgSlider(tMove, "DashLength", "Dash Length", 1, 1, 20, function()
+    if CFG.DashLengthEnabled then manageDashLength() end
+end)
 addCfgToggle(tMove, "WalkOnWater", "Walk on Water", "Expands WaterBase-Plane", function(on) if on then startWalkOnWater() else stopWalkOnWater() end end)
 tMove:Button({ Title = "Remove Water Surface", Desc = "One-shot WaterBase-Plane removal", Callback = removeWaterTick })
 
@@ -2171,10 +2371,11 @@ tGlitch:Button({
 tGlitch:Dropdown({
     Title = "Super Jump Keybind",
     Values = { "H", "J", "K", "L", "U", "Y" },
-    Value = "H",
+    Value = CFG.SuperJumpKey.Name,
     Callback = function(keyName)
         if Enum.KeyCode[keyName] then
             CFG.SuperJumpKey = Enum.KeyCode[keyName]
+            scheduleAutoSave()
         end
     end,
 })
@@ -2207,12 +2408,7 @@ addCfgToggle(tExp, "ExpSmoothAimBlend",   "Smooth Aim Blend ( experimental )",  
 
 -- WORLD TAB
 tWorld:Section({ Title = "Environment & Utilities" })
-tWorld:Slider({
-    Title = "Camera Max Zoom",
-    Step = 10,
-    Value = { Min = 1, Max = 2000, Default = CFG.CameraZoom },
-    Callback = function(v) CFG.CameraZoom = v; applyCameraZoom() end,
-})
+addCfgSlider(tWorld, "CameraZoom", "Camera Max Zoom", 10, 1, 2000, function() applyCameraZoom() end)
 tWorld:Button({ Title = "Remove Lava", Desc = "Destroys Lava parts in workspace", Callback = removeLava })
 tWorld:Button({ Title = "Remove Fog",  Desc = "Pushes FogEnd out and clears LightingLayers", Callback = removeFog })
 addCfgToggle(tWorld, "BringMobs", "Bring Mobs", "Pulls nearby mobs below feet", function(on) if on then startBringMobs() else stopBringMobs() end end)
@@ -2254,12 +2450,7 @@ addCfgToggle(tESP, "ESP_HP",       "Show HP",        "")
 addCfgToggle(tESP, "ESP_Highlight","Highlight ESP",  "Adds crimson Highlight to players", function()
     if CFG.ESPEnabled then disableESP(); enableESP() end
 end)
-tESP:Slider({
-    Title = "ESP Text Size",
-    Step = 1,
-    Value = { Min = 8, Max = 32, Default = CFG.ESP_TextSize },
-    Callback = function(v) CFG.ESP_TextSize = v end,
-})
+addCfgSlider(tESP, "ESP_TextSize", "ESP Text Size", 1, 8, 32)
 
 -- TP / HOP TAB
 tTP:Section({ Title = "Target & Chase" })
@@ -2350,27 +2541,17 @@ addCfgToggle(tKen, "AutoKen", "Auto Ken [F5]", "5-layer detection + CommE Ken")
 tKen:Dropdown({
     Title = "Ken Key",
     Values = { "Q", "E", "R", "G", "H", "V" },
-    Value = "Q",
-    Callback = function(k) CFG.KenKey = Enum.KeyCode[k] end,
+    Value = CFG.KenKey.Name,
+    Callback = function(k)
+        if Enum.KeyCode[k] then
+            CFG.KenKey = Enum.KeyCode[k]
+            scheduleAutoSave()
+        end
+    end,
 })
-tKen:Slider({
-    Title = "Ken Range (studs)",
-    Step = 1,
-    Value = { Min = 10, Max = 150, Default = CFG.KenRange },
-    Callback = function(v) CFG.KenRange = v end,
-})
-tKen:Slider({
-    Title = "Reaction Delay (s)",
-    Step = 0.01,
-    Value = { Min = 0, Max = 0.3, Default = CFG.KenReaction },
-    Callback = function(v) CFG.KenReaction = v end,
-})
-tKen:Slider({
-    Title = "Cooldown (s)",
-    Step = 0.05,
-    Value = { Min = 0.1, Max = 2.0, Default = CFG.KenCooldown },
-    Callback = function(v) CFG.KenCooldown = v end,
-})
+addCfgSlider(tKen, "KenRange",    "Ken Range (studs)",  1,    10,  150)
+addCfgSlider(tKen, "KenReaction", "Reaction Delay (s)", 0.01, 0,   0.3)
+addCfgSlider(tKen, "KenCooldown", "Cooldown (s)",       0.05, 0.1, 2.0)
 
 -- WHITELIST TAB
 tWL:Section({ Title = "Player Protection" })
@@ -2391,15 +2572,61 @@ tWL:Button({
 tWL:Button({
     Title = "Whitelist Selected",
     Callback = function()
-        if selectedWL then Whitelist[selectedWL] = true end
+        if selectedWL then
+            Whitelist[selectedWL] = true
+            scheduleAutoSave()
+        end
     end,
 })
 tWL:Button({
     Title = "Remove From Whitelist",
     Callback = function()
-        if selectedWL then Whitelist[selectedWL] = nil end
+        if selectedWL then
+            Whitelist[selectedWL] = nil
+            scheduleAutoSave()
+        end
     end,
 })
+
+-- CONFIG TAB
+tConfig:Section({ Title = "Auto-Save, Auto-Exec & Stream Guard" })
+addCfgToggle(tConfig, "AutoSaveConfig",   "Auto-Save Config",        "Automatically saves enabled options to test/config.json", function(on)
+    if on then saveConfigFile(true) end
+end)
+addCfgToggle(tConfig, "AutoExec",         "Auto-Execute on Inject",  "Writes autoexec/test_AutoExec.lua & queues on teleport", function(on)
+    syncAutoExec(on)
+    saveConfigFile(true)
+end)
+addCfgToggle(tConfig, "ScreenShareProof", "Screen-Share Proof",      "Auto-enabled capture-signal guard for FOV overlays")
+tConfig:Button({
+    Title = "Cache Clipboard to test/cached_test.lua",
+    Desc = "Copy full script first, then click so Auto-Exec has the script payload",
+    Callback = cacheScriptFromClipboard,
+})
+tConfig:Button({
+    Title = "Save Config Now",
+    Desc = "Immediately writes settings & whitelist to test/config.json",
+    Callback = function() saveConfigFile(false) end,
+})
+tConfig:Button({
+    Title = "Load Config Now",
+    Desc = "Reloads settings & whitelist from test/config.json",
+    Callback = function() loadConfigFile(false) end,
+})
+if tConfig.Input then
+    pcall(function()
+        tConfig:Input({
+            Title = "Hosted Script URL (Optional)",
+            Placeholder = "https://raw.githubusercontent.com/...",
+            Value = CFG.HostedScriptUrl,
+            Callback = function(txt)
+                CFG.HostedScriptUrl = tostring(txt or "")
+                if CFG.AutoExec then syncAutoExec(true) end
+                scheduleAutoSave()
+            end,
+        })
+    end)
+end
 
 Players.PlayerRemoving:Connect(function(pl)
     if ChaseTarget == pl then ChaseTarget = nil end
@@ -2442,5 +2669,9 @@ UserInputService.InputBegan:Connect(function(i, gp)
     end
 end)
 
+loadConfigFile(true)
+if CFG.AutoExec then
+    syncAutoExec(true)
+end
 task.spawn(applyCameraZoom)
-print("[test] Loaded | RShift=UI | G=z boost | H=super jump | F1-F5=Combat/Soru/Ken")
+print("[test] Loaded | AutoSave=" .. tostring(CFG.AutoSaveConfig) .. " | AutoExec=" .. tostring(CFG.AutoExec) .. " | ScreenShareProof=" .. tostring(CFG.ScreenShareProof))
